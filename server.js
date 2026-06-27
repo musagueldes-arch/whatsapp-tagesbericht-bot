@@ -3,7 +3,7 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 
-const { extractReports } = require('./lib/anthropic');
+const { extractReports, extractReportsFromImage } = require('./lib/anthropic');
 const { generateReportPdfBuffer } = require('./lib/pdf');
 const { sendText, uploadMedia, sendDocument, downloadMedia } = require('./lib/whatsapp');
 const { transcribeAudio } = require('./lib/transcribe');
@@ -86,6 +86,32 @@ async function buildAndSendReports(from, rawText, fotos) {
   }
 }
 
+async function buildAndSendFromImage(from, buffer, mimeType, caption) {
+  await sendText(from, '🔎 Notiz wird gelesen …');
+  let reports;
+  try {
+    reports = await extractReportsFromImage(buffer, mimeType, caption);
+  } catch (err) {
+    console.error('Fehler beim Lesen des Fotos:', err);
+    await sendText(from, '⚠️ Ich konnte die Notiz auf dem Foto nicht sicher lesen. Bitte schick ein schaerferes Foto oder den Text als Nachricht.');
+    return;
+  }
+  if (!reports || !reports.length) {
+    await sendText(from, '⚠️ Auf dem Foto war kein Bericht erkennbar. Bitte schick ein schaerferes Foto.');
+    return;
+  }
+  await sendText(from, '📝 Bericht wird erstellt …');
+  for (let i = 0; i < reports.length; i++) {
+    const report = reports[i];
+    if (i === 0) report.fotos = [buffer];
+    const pdfBuffer = await generateReportPdfBuffer(report, company);
+    const filename = `Tagesbericht_${safeName(report.kunde)}_${(report.datum || '').replace(/\./g, '-')}.pdf`;
+    fs.writeFileSync(path.join(REPORTS_DIR, filename), pdfBuffer);
+    const mediaId = await uploadMedia(pdfBuffer, filename, 'application/pdf');
+    await sendDocument(from, mediaId, filename, `${report.kunde || ''} – ${report.datum || ''}`.trim());
+  }
+}
+
 async function handleIncoming(body) {
   const entry = body && body.entry && body.entry[0];
   const change = entry && entry.changes && entry.changes[0];
@@ -118,14 +144,9 @@ async function handleIncoming(body) {
       }
 
       if (msg.type === 'image') {
-        const { buffer } = await downloadMedia(msg.image.id);
+        const { buffer, mimeType } = await downloadMedia(msg.image.id);
         const caption = msg.image.caption && msg.image.caption.trim();
-        if (caption) {
-          await buildAndSendReports(from, caption, [buffer]);
-        } else {
-          stashPhoto(from, buffer);
-          await sendText(from, '📷 Foto gespeichert. Schick mir jetzt den Bericht als Text oder Sprachnachricht, dann haenge ich das Foto an.');
-        }
+        await buildAndSendFromImage(from, buffer, mimeType, caption);
         continue;
       }
 
