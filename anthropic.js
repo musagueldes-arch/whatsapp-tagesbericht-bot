@@ -1,3 +1,5 @@
+
+module.exports = { extractReports, parseModelText, buildSystemPrompt };
 const { todayStr } = require('./util');
 
 function buildSystemPrompt() {
@@ -5,16 +7,16 @@ function buildSystemPrompt() {
     "Du wandelst unstrukturierte WhatsApp-Nachrichten und Fotos von Handwerkern (Heizung/Sanitaer/Elektro) " +
     "in strukturierte Tagesberichte um. Antworte AUSSCHLIESSLICH mit einem JSON-Array, ohne Markdown, " +
     "ohne Code-Fences, ohne Erklaerungen davor oder danach. Jedes Objekt im Array ist ein eigenstaendiger " +
-    "Tagesbericht (eine Baustelle/ein Kunde/ein Tag). Falls der Text mehrere Baustellen, Kunden oder Tage " +
-    "behandelt, erstelle fuer jeden ein eigenes Objekt. Erfinde nichts, was nicht im Text oder auf den Fotos " +
-    "erkennbar ist - wenn etwas nicht erkennbar ist, lasse das Feld leer. Heutiges Datum: " + todayStr() + ". " +
-    "Beschreibe bei Fotos kurz, was darauf zu sehen ist (Schaeden, Installationen, Materialien) und fuege " +
-    "das in das Feld 'besonderheiten' ein, sofern es nicht schon aus dem Text hervorgeht. " +
+    "Tagesbericht (eine Baustelle/ein Kunde/ein Tag). Erfinde nichts, was nicht im Text oder auf den Fotos " +
+    "erkennbar ist. Heutiges Datum: " + todayStr() + ". " +
+    "WICHTIG FUER FOTOS: Beschreibe was auf den Fotos zu sehen ist (z.B. Schaeden, Leckagen, Installationen, " +
+    "Materialien, Zustand vor/nach der Arbeit) und trage diese Beschreibung IMMER in das Feld 'besonderheiten' ein. " +
+    "Wenn bereits Text im Feld 'besonderheiten' steht, haenge die Foto-Beschreibung mit ' | Fotos: ' davor an. " +
     "Jedes Objekt hat exakt diese Felder: " +
     '{"datum":"TT.MM.JJJJ","kunde":"Kunde/Baustelle/Adresse","referenz":"Auftrags-/Projektnummer falls erkennbar, sonst leer",' +
     '"mitarbeiter":["Name"],"arbeitszeit":"z.B. 07:00-14:30 oder Stundenzahl",' +
     '"arbeiten":["durchgefuehrte Arbeit als kurzer Punkt"],"material":["verwendetes Material"],' +
-    '"besonderheiten":"Probleme, Maengel, offene Punkte, Foto-Beschreibung - sonst leer"}'
+    '"besonderheiten":"Foto-Beschreibung und/oder Probleme, Maengel, offene Punkte"}'
   );
 }
 
@@ -45,13 +47,10 @@ function parseModelText(text) {
   }
 }
 
-// rawText: String (Beschreibung des Monteurs)
-// images: Array von { base64, mimeType } (optional, kann leer sein)
 async function extractReports(rawText, images = []) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error('ANTHROPIC_API_KEY ist nicht gesetzt (.env pruefen)');
 
-  // Nachrichteninhalt aufbauen: erst Bilder, dann Text
   const contentParts = [];
 
   for (const img of images) {
@@ -63,7 +62,7 @@ async function extractReports(rawText, images = []) {
 
   const textContent = rawText && rawText.trim()
     ? rawText.trim()
-    : '(Kein Begleittext – bitte Informationen aus den Fotos entnehmen)';
+    : '(Kein Begleittext – bitte alle Informationen aus den Fotos entnehmen und im Feld besonderheiten beschreiben)';
 
   contentParts.push({ type: 'text', text: textContent });
 
@@ -76,7 +75,7 @@ async function extractReports(rawText, images = []) {
     },
     body: JSON.stringify({
       model: 'claude-sonnet-4-6',
-      max_tokens: 1000,
+      max_tokens: 1500,
       system: buildSystemPrompt(),
       messages: [{ role: 'user', content: contentParts }]
     })
