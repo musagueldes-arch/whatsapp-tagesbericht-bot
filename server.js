@@ -25,23 +25,45 @@ const REPORTS_DIR = path.join(__dirname, 'reports');
 if (!fs.existsSync(REPORTS_DIR)) fs.mkdirSync(REPORTS_DIR);
 
 // ---------------------------------------------------------------
-// Session-Verwaltung (in-memory, wird bei Server-Neustart geleert)
-// Schlüssel: WhatsApp-Nummer (from)
+// Whisper-Transkription (OpenAI)
 // ---------------------------------------------------------------
-const SESSION_TIMEOUT_MS = 30 * 60 * 1000; // 30 Minuten
-const sessions = new Map();
+async function transcribeAudio(audioBuffer, mimeType) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error('OPENAI_API_KEY nicht gesetzt');
 
-function getSession(from) {
-  return sessions.get(from) || null;
+  // WhatsApp liefert meist audio/ogg oder audio/mpeg
+  const ext = mimeType.includes('ogg') ? 'ogg' : mimeType.includes('mpeg') ? 'mp3' : 'ogg';
+  const filename = `voice.${ext}`;
+
+  const form = new FormData();
+  form.append('file', new Blob([audioBuffer], { type: mimeType }), filename);
+  form.append('model', 'whisper-1');
+  form.append('language', 'de');
+
+  const resp = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiKey}` },
+    body: form
+  });
+
+  if (!resp.ok) {
+    const err = await resp.text();
+    throw new Error(`Whisper Fehler ${resp.status}: ${err}`);
+  }
+  const data = await resp.json();
+  return data.text || '';
 }
 
+// ---------------------------------------------------------------
+// Session-Verwaltung
+// ---------------------------------------------------------------
+const SESSION_TIMEOUT_MS = 30 * 60 * 1000;
+const sessions = new Map();
+
+function getSession(from) { return sessions.get(from) || null; }
+
 function createSession(from) {
-  const session = {
-    status: 'collecting', // 'collecting' | 'done'
-    photos: [],           // [{ base64, mimeType }]
-    text: '',             // Begleittext des Monteurs
-    timer: null
-  };
+  const session = { status: 'collecting', photos: [], text: '', timer: null };
   resetSessionTimer(from, session);
   sessions.set(from, session);
   return session;
@@ -51,7 +73,7 @@ function resetSessionTimer(from, session) {
   if (session.timer) clearTimeout(session.timer);
   session.timer = setTimeout(() => {
     sessions.delete(from);
-    console.log(`Session fuer ${from} abgelaufen und geloescht.`);
+    console.log(`Session ${from} abgelaufen.`);
   }, SESSION_TIMEOUT_MS);
 }
 
@@ -61,22 +83,18 @@ function clearSession(from) {
   sessions.delete(from);
 }
 
-// ---------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------
 function safeName(s) {
   return (s || 'Bericht').replace(/[^a-zA-Z0-9äöüÄÖÜß_\- ]/g, '').trim().replace(/\s+/g, '_') || 'Bericht';
 }
 
 const FERTIG_KEYWORDS = ['fertig', 'ok', 'ja', 'done', 'go', 'weiter', 'erstellen', 'bericht'];
-
-function isFertigText(text) {
+function isFertig(text) {
   if (!text) return false;
   return FERTIG_KEYWORDS.some(k => text.toLowerCase().trim().startsWith(k));
 }
 
 // ---------------------------------------------------------------
-// Webhook-Verifizierung
+// Webhook
 // ---------------------------------------------------------------
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
@@ -86,9 +104,6 @@ app.get('/webhook', (req, res) => {
   return res.sendStatus(403);
 });
 
-// ---------------------------------------------------------------
-// Eingehende Nachrichten
-// ---------------------------------------------------------------
 app.post('/webhook', (req, res) => {
   res.sendStatus(200);
   handleIncoming(req.body).catch(err => console.error('Fehler:', err));
@@ -100,13 +115,11 @@ async function handleIncoming(body) {
   const value = change && change.value;
   const messages = value && value.messages;
   if (!messages || !messages.length) return;
-
   for (const msg of messages) {
     const from = msg.from;
-    try {
-      await handleMessage(from, msg);
-    } catch (err) {
-      console.error(`Fehler bei Nachricht von ${from}:`, err);
+    try { await handleMessage(from, msg); }
+    catch (err) {
+      console.error(`Fehler bei ${from}:`, err);
       await sendText(from, '⚠️ Fehler bei der Verarbeitung. Bitte erneut versuchen.').catch(() => {});
     }
   }
@@ -116,94 +129,95 @@ async function handleMessage(from, msg) {
   const type = msg.type;
   const session = getSession(from);
 
-  // ---- FOTO empfangen ----
+  // ---- FOTO ----
   if (type === 'image') {
-    const mediaId = msg.image.id;
+    const imgData = await downloadMedia(msg.image.id);
     const caption = msg.image.caption || '';
 
-    // Foto herunterladen
-    const imgData = await downloadMedia(mediaId);
-
     if (!session) {
-      // Neue Session starten
       const s = createSession(from);
       s.photos.push(imgData);
       if (caption) s.text = caption;
-
       await sendText(from,
         `📸 Foto ${s.photos.length} erhalten.\n\n` +
-        `Gehören noch weitere Fotos dazu? Falls ja, schick sie einfach weiter.\n\n` +
-        `Wenn du fertig bist:\n` +
-        `• Schreib eine kurze Beschreibung (Baustelle, Arbeiten, Uhrzeit)\n` +
-        `• Oder schreib einfach *fertig* um den Bericht zu erstellen`
+        `Noch mehr Fotos? Schick sie einfach weiter.\n\n` +
+        `Wenn fertig: kurze Beschreibung schicken (Baustelle, Arbeiten, Uhrzeit) oder *fertig* tippen.`
       );
     } else {
-      // Weitere Fotos zur bestehenden Session hinzufügen
       session.photos.push(imgData);
       if (caption) session.text += (session.text ? '\n' : '') + caption;
       resetSessionTimer(from, session);
-
       await sendText(from,
-        `📸 Foto ${session.photos.length} hinzugefügt.\n\n` +
-        `Noch mehr Fotos? Oder Beschreibung/Text schicken um den Bericht zu erstellen.`
+        `📸 Foto ${session.photos.length} hinzugefügt.\n\nNoch mehr? Oder Beschreibung / Text schicken.`
       );
     }
     return;
   }
 
-  // ---- SPRACHNOTIZ empfangen ----
+  // ---- SPRACHNOTIZ ----
   if (type === 'audio') {
-    if (!session) {
-      await sendText(from,
-        '🎤 Sprachnotizen kann ich leider noch nicht automatisch transkribieren.\n\n' +
-        'Bitte schreib die wichtigsten Infos als Text:\n' +
-        '• Baustelle / Kunde\n' +
-        '• Was wurde gemacht?\n' +
-        '• Arbeitszeit\n' +
-        '• Verwendetes Material'
-      );
-    } else {
-      // Es gibt eine aktive Session mit Fotos – Text anfordern
-      await sendText(from,
-        '🎤 Sprachnotizen kann ich noch nicht verarbeiten.\n\n' +
-        `Du hast bereits ${session.photos.length} Foto(s) gesendet.\n` +
-        'Schreib die Beschreibung kurz als Text, dann erstelle ich den Bericht.'
-      );
+    await sendText(from, '🎤 Sprachnotiz wird transkribiert …');
+    try {
+      const { base64, mimeType } = await downloadMedia(msg.audio.id);
+      const audioBuffer = Buffer.from(base64, 'base64');
+      const transcript = await transcribeAudio(audioBuffer, mimeType);
+
+      if (!transcript || transcript.trim().length < 3) {
+        await sendText(from, '⚠️ Sprachnotiz konnte nicht erkannt werden. Bitte nochmal sprechen oder als Text schicken.');
+        return;
+      }
+
+      console.log(`Transkription von ${from}: ${transcript}`);
+
+      if (!session) {
+        // Sprachnotiz alleine → direkt Bericht erstellen
+        await sendText(from, `📝 Erkannt: "${transcript}"\n\nBericht wird erstellt …`);
+        await createAndSendReports(from, transcript, []);
+      } else {
+        // Es gibt eine aktive Foto-Session → Transkript als Text hinzufügen
+        session.text += (session.text ? '\n' : '') + transcript;
+        resetSessionTimer(from, session);
+        const photos = session.photos;
+        const combinedText = session.text;
+        clearSession(from);
+        await sendText(from, `📝 Erkannt: "${transcript}"\n\n🔍 ${photos.length} Foto(s) + Sprachnotiz werden ausgewertet …`);
+        await sendText(from, '📝 Bericht wird erstellt …');
+        await createAndSendReports(from, combinedText, photos);
+      }
+    } catch (err) {
+      console.error('Whisper Fehler:', err);
+      await sendText(from, '⚠️ Transkription fehlgeschlagen. Bitte als Text schicken.');
     }
     return;
   }
 
-  // ---- TEXT empfangen ----
+  // ---- TEXT ----
   if (type === 'text') {
     const rawText = msg.text.body;
 
     if (!session) {
-      // Kein laufender Sammelvorgang → direkt als reinen Textbericht verarbeiten
+      // Reiner Textbericht
       await sendText(from, '🔍 Notiz wird gelesen …');
       await sendText(from, '📝 Bericht wird erstellt …');
       await createAndSendReports(from, rawText, []);
       return;
     }
 
-    // Es gibt eine aktive Session mit Fotos
-    if (isFertigText(rawText) && !session.text) {
-      // Nur "fertig" ohne vorherigen Beschreibungstext → kurz nachfragen
+    // Aktive Foto-Session
+    if (isFertig(rawText) && !session.text) {
+      // Erstes "fertig" ohne Text → kurz nachfragen
       await sendText(from,
         `Du hast ${session.photos.length} Foto(s) gesendet.\n\n` +
-        'Magst du noch kurz dazuschreiben:\n' +
-        '• Baustelle / Kunde?\n' +
-        '• Was wurde gemacht?\n' +
-        '• Uhrzeit?\n\n' +
-        'Oder schreib nochmal *fertig* um den Bericht nur mit den Fotos zu erstellen.'
+        'Magst du noch kurz ergänzen:\n• Baustelle / Kunde?\n• Was wurde gemacht?\n• Uhrzeit?\n\n' +
+        'Oder schick nochmal *fertig* für Bericht nur mit Fotos.'
       );
       session.text = '__nachgefragt__';
       resetSessionTimer(from, session);
       return;
     }
 
-    // Text zur Session hinzufügen (oder zweites "fertig" ohne Text)
     if (rawText.toLowerCase().trim() !== 'fertig' || session.text !== '__nachgefragt__') {
-      session.text = (session.text === '__nachgefragt__' ? '' : session.text + (session.text ? '\n' : '')) + rawText;
+      session.text = (session.text === '__nachgefragt__' ? '' : (session.text ? session.text + '\n' : '')) + rawText;
     }
 
     resetSessionTimer(from, session);
@@ -217,10 +231,8 @@ async function handleMessage(from, msg) {
     return;
   }
 
-  // ---- Sonstiger Nachrichtentyp ----
-  await sendText(from,
-    'Ich kann aktuell Text und Fotos verarbeiten. Sprachnotizen bitte als Text schicken.'
-  );
+  // ---- Sonstiges ----
+  await sendText(from, 'Ich kann Text, Fotos und Sprachnotizen verarbeiten.');
 }
 
 async function createAndSendReports(from, text, images) {
@@ -234,7 +246,7 @@ async function createAndSendReports(from, text, images) {
       await sendDocument(from, mediaId, filename, `${report.kunde || ''} – ${report.datum || ''}`.trim());
     }
   } catch (err) {
-    console.error('Fehler bei Berichtserstellung:', err);
+    console.error('Bericht-Fehler:', err);
     await sendText(from, '⚠️ Bericht konnte nicht erstellt werden. Bitte erneut versuchen.').catch(() => {});
   }
 }
