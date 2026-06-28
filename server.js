@@ -3,17 +3,15 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 
-const { extractReports, extractReportsFromImage } = require('./lib/anthropic');
+const { extractReports } = require('./lib/anthropic');
 const { generateReportPdfBuffer } = require('./lib/pdf');
 const { sendText, uploadMedia, sendDocument, downloadMedia } = require('./lib/whatsapp');
-const { transcribeAudio } = require('./lib/transcribe');
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || 'changeme';
-const CHEF_NUMBER = (process.env.CHEF_NUMBER || '').replace(/[^0-9]/g, '');
 
 const company = {
   firma: process.env.COMPANY_NAME || 'G-Therm Haustechnik',
@@ -26,118 +24,75 @@ const company = {
 const REPORTS_DIR = path.join(__dirname, 'reports');
 if (!fs.existsSync(REPORTS_DIR)) fs.mkdirSync(REPORTS_DIR);
 
-const HILFE_TEXT =
-  'G-Therm Bot – das kann ich:\n\n' +
-  '📝 Tagesbericht: Schick mir einfach als Text oder Sprachnachricht, was du gemacht hast ' +
-  '(Kunde/Baustelle, Arbeiten, Stunden, Material). Ich erstelle daraus eine fertige PDF.\n\n' +
-  '🎤 Sprachnachricht: Funktioniert auf Deutsch, Türkisch und Albanisch.\n\n' +
-  '📷 Foto: Schick ein Foto von einer handschriftlichen Notiz – ich lese sie aus und mache ' +
-  'einen Tagesbericht oder eine Materialliste daraus. Schreib "Material" dazu, wenn es eine Liste ist.\n\n' +
-  'Schreib jederzeit "Hilfe" für diese Übersicht.';
+// ---------------------------------------------------------------
+// Session-Verwaltung (in-memory, wird bei Server-Neustart geleert)
+// Schlüssel: WhatsApp-Nummer (from)
+// ---------------------------------------------------------------
+const SESSION_TIMEOUT_MS = 30 * 60 * 1000; // 30 Minuten
+const sessions = new Map();
 
-async function forwardToChef(from, mediaId, filename, report) {
-  if (!CHEF_NUMBER) return;
-  if (from === CHEF_NUMBER) return;
-  try {
-    const info =
-      'Neuer Bericht von ' + from + '\n' +
-      'Kunde: ' + (report.kunde || '-') + '\n' +
-      'Datum: ' + (report.datum || '-');
-    await sendText(CHEF_NUMBER, info);
-    await sendDocument(CHEF_NUMBER, mediaId, filename, (report.kunde || '') + ' – ' + (report.datum || ''));
-  } catch (err) {
-    console.error('Chef-Weiterleitung fehlgeschlagen:', err);
-  }
+function getSession(from) {
+  return sessions.get(from) || null;
 }
 
-// Zwischenspeicher fuer Fotos ohne Begleittext (pro Absender).
-const pendingPhotos = {};
-const PHOTO_TTL_MS = 10 * 60 * 1000;
+function createSession(from) {
+  const session = {
+    status: 'collecting', // 'collecting' | 'done'
+    photos: [],           // [{ base64, mimeType }]
+    text: '',             // Begleittext des Monteurs
+    timer: null
+  };
+  resetSessionTimer(from, session);
+  sessions.set(from, session);
+  return session;
+}
 
+function resetSessionTimer(from, session) {
+  if (session.timer) clearTimeout(session.timer);
+  session.timer = setTimeout(() => {
+    sessions.delete(from);
+    console.log(`Session fuer ${from} abgelaufen und geloescht.`);
+  }, SESSION_TIMEOUT_MS);
+}
+
+function clearSession(from) {
+  const s = sessions.get(from);
+  if (s && s.timer) clearTimeout(s.timer);
+  sessions.delete(from);
+}
+
+// ---------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------
 function safeName(s) {
   return (s || 'Bericht').replace(/[^a-zA-Z0-9äöüÄÖÜß_\- ]/g, '').trim().replace(/\s+/g, '_') || 'Bericht';
 }
 
-function stashPhoto(from, buffer) {
-  if (!pendingPhotos[from]) pendingPhotos[from] = { fotos: [], timer: null };
-  pendingPhotos[from].fotos.push(buffer);
-  if (pendingPhotos[from].timer) clearTimeout(pendingPhotos[from].timer);
-  pendingPhotos[from].timer = setTimeout(() => {
-    delete pendingPhotos[from];
-  }, PHOTO_TTL_MS);
+const FERTIG_KEYWORDS = ['fertig', 'ok', 'ja', 'done', 'go', 'weiter', 'erstellen', 'bericht'];
+
+function isFertigText(text) {
+  if (!text) return false;
+  return FERTIG_KEYWORDS.some(k => text.toLowerCase().trim().startsWith(k));
 }
 
-function takePhotos(from) {
-  const entry = pendingPhotos[from];
-  if (!entry) return [];
-  if (entry.timer) clearTimeout(entry.timer);
-  delete pendingPhotos[from];
-  return entry.fotos;
-}
-
-// --- Meta Webhook-Verifizierung ---
+// ---------------------------------------------------------------
+// Webhook-Verifizierung
+// ---------------------------------------------------------------
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-    return res.status(200).send(challenge);
-  }
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) return res.status(200).send(challenge);
   return res.sendStatus(403);
 });
 
-// --- Eingehende WhatsApp-Nachrichten ---
+// ---------------------------------------------------------------
+// Eingehende Nachrichten
+// ---------------------------------------------------------------
 app.post('/webhook', (req, res) => {
   res.sendStatus(200);
-  handleIncoming(req.body).catch((err) => {
-    console.error('Fehler bei der Verarbeitung einer Nachricht:', err);
-  });
+  handleIncoming(req.body).catch(err => console.error('Fehler:', err));
 });
-
-async function buildAndSendReports(from, rawText, fotos) {
-  await sendText(from, '📝 Bericht wird erstellt …');
-  const reports = await extractReports(rawText);
-
-  for (let i = 0; i < reports.length; i++) {
-    const report = reports[i];
-    if (i === 0 && fotos && fotos.length) report.fotos = fotos;
-
-    const pdfBuffer = await generateReportPdfBuffer(report, company);
-    const filename = `Tagesbericht_${safeName(report.kunde)}_${(report.datum || '').replace(/\./g, '-')}.pdf`;
-    fs.writeFileSync(path.join(REPORTS_DIR, filename), pdfBuffer);
-
-    const mediaId = await uploadMedia(pdfBuffer, filename, 'application/pdf');
-    await sendDocument(from, mediaId, filename, `${report.kunde || ''} – ${report.datum || ''}`.trim());
-    await forwardToChef(from, mediaId, filename, report);
-  }
-}
-
-async function buildAndSendFromImage(from, buffer, mimeType, caption) {
-  await sendText(from, '🔎 Notiz wird gelesen …');
-  let reports;
-  try {
-    reports = await extractReportsFromImage(buffer, mimeType, caption);
-  } catch (err) {
-    console.error('Fehler beim Lesen des Fotos:', err);
-    await sendText(from, '⚠️ Ich konnte die Notiz auf dem Foto nicht sicher lesen. Bitte schick ein schaerferes Foto oder den Text als Nachricht.');
-    return;
-  }
-  if (!reports || !reports.length) {
-    await sendText(from, '⚠️ Auf dem Foto war kein Bericht erkennbar. Bitte schick ein schaerferes Foto.');
-    return;
-  }
-  await sendText(from, '📝 Bericht wird erstellt …');
-  for (let i = 0; i < reports.length; i++) {
-    const report = reports[i];
-    if (i === 0) report.fotos = [buffer];
-    const pdfBuffer = await generateReportPdfBuffer(report, company);
-    const filename = `Tagesbericht_${safeName(report.kunde)}_${(report.datum || '').replace(/\./g, '-')}.pdf`;
-    fs.writeFileSync(path.join(REPORTS_DIR, filename), pdfBuffer);
-    const mediaId = await uploadMedia(pdfBuffer, filename, 'application/pdf');
-    await sendDocument(from, mediaId, filename, `${report.kunde || ''} – ${report.datum || ''}`.trim());
-    await forwardToChef(from, mediaId, filename, report);
-  }
-}
 
 async function handleIncoming(body) {
   const entry = body && body.entry && body.entry[0];
@@ -148,51 +103,139 @@ async function handleIncoming(body) {
 
   for (const msg of messages) {
     const from = msg.from;
-
     try {
-      if (msg.type === 'text') {
-        const body = (msg.text.body || '').trim();
-        if (/^(hilfe|help|menu|men[üu]|start|\?)$/i.test(body)) {
-          await sendText(from, HILFE_TEXT);
-          continue;
-        }
-        const fotos = takePhotos(from);
-        await buildAndSendReports(from, body, fotos);
-        continue;
-      }
-
-      if (msg.type === 'audio' || msg.type === 'voice') {
-        const media = msg.audio || msg.voice;
-        await sendText(from, '🎙️ Sprachnachricht wird ausgewertet …');
-        const { buffer, mimeType } = await downloadMedia(media.id);
-        const text = await transcribeAudio(buffer, mimeType);
-        if (!text) {
-          await sendText(from, '⚠️ Die Sprachnachricht konnte nicht verstanden werden. Bitte erneut aufnehmen.');
-          continue;
-        }
-        const fotos = takePhotos(from);
-        await buildAndSendReports(from, text, fotos);
-        continue;
-      }
-
-      if (msg.type === 'image') {
-        const { buffer, mimeType } = await downloadMedia(msg.image.id);
-        const caption = msg.image.caption && msg.image.caption.trim();
-        await buildAndSendFromImage(from, buffer, mimeType, caption);
-        continue;
-      }
-
-      await sendText(
-        from,
-        'Ich verarbeite Text, Sprachnachrichten und Fotos. Bitte schick den Tagesbericht als Text oder Sprachnachricht (Fotos optional).'
-      );
+      await handleMessage(from, msg);
     } catch (err) {
-      console.error('Fehler bei Berichtserstellung:', err);
-      await sendText(
-        from,
-        '⚠️ Der Bericht konnte nicht automatisch erstellt werden. Bitte erneut versuchen.'
-      ).catch((e) => console.error(e));
+      console.error(`Fehler bei Nachricht von ${from}:`, err);
+      await sendText(from, '⚠️ Fehler bei der Verarbeitung. Bitte erneut versuchen.').catch(() => {});
     }
+  }
+}
+
+async function handleMessage(from, msg) {
+  const type = msg.type;
+  const session = getSession(from);
+
+  // ---- FOTO empfangen ----
+  if (type === 'image') {
+    const mediaId = msg.image.id;
+    const caption = msg.image.caption || '';
+
+    // Foto herunterladen
+    const imgData = await downloadMedia(mediaId);
+
+    if (!session) {
+      // Neue Session starten
+      const s = createSession(from);
+      s.photos.push(imgData);
+      if (caption) s.text = caption;
+
+      await sendText(from,
+        `📸 Foto ${s.photos.length} erhalten.\n\n` +
+        `Gehören noch weitere Fotos dazu? Falls ja, schick sie einfach weiter.\n\n` +
+        `Wenn du fertig bist:\n` +
+        `• Schreib eine kurze Beschreibung (Baustelle, Arbeiten, Uhrzeit)\n` +
+        `• Oder schreib einfach *fertig* um den Bericht zu erstellen`
+      );
+    } else {
+      // Weitere Fotos zur bestehenden Session hinzufügen
+      session.photos.push(imgData);
+      if (caption) session.text += (session.text ? '\n' : '') + caption;
+      resetSessionTimer(from, session);
+
+      await sendText(from,
+        `📸 Foto ${session.photos.length} hinzugefügt.\n\n` +
+        `Noch mehr Fotos? Oder Beschreibung/Text schicken um den Bericht zu erstellen.`
+      );
+    }
+    return;
+  }
+
+  // ---- SPRACHNOTIZ empfangen ----
+  if (type === 'audio') {
+    if (!session) {
+      await sendText(from,
+        '🎤 Sprachnotizen kann ich leider noch nicht automatisch transkribieren.\n\n' +
+        'Bitte schreib die wichtigsten Infos als Text:\n' +
+        '• Baustelle / Kunde\n' +
+        '• Was wurde gemacht?\n' +
+        '• Arbeitszeit\n' +
+        '• Verwendetes Material'
+      );
+    } else {
+      // Es gibt eine aktive Session mit Fotos – Text anfordern
+      await sendText(from,
+        '🎤 Sprachnotizen kann ich noch nicht verarbeiten.\n\n' +
+        `Du hast bereits ${session.photos.length} Foto(s) gesendet.\n` +
+        'Schreib die Beschreibung kurz als Text, dann erstelle ich den Bericht.'
+      );
+    }
+    return;
+  }
+
+  // ---- TEXT empfangen ----
+  if (type === 'text') {
+    const rawText = msg.text.body;
+
+    if (!session) {
+      // Kein laufender Sammelvorgang → direkt als reinen Textbericht verarbeiten
+      await sendText(from, '🔍 Notiz wird gelesen …');
+      await sendText(from, '📝 Bericht wird erstellt …');
+      await createAndSendReports(from, rawText, []);
+      return;
+    }
+
+    // Es gibt eine aktive Session mit Fotos
+    if (isFertigText(rawText) && !session.text) {
+      // Nur "fertig" ohne vorherigen Beschreibungstext → kurz nachfragen
+      await sendText(from,
+        `Du hast ${session.photos.length} Foto(s) gesendet.\n\n` +
+        'Magst du noch kurz dazuschreiben:\n' +
+        '• Baustelle / Kunde?\n' +
+        '• Was wurde gemacht?\n' +
+        '• Uhrzeit?\n\n' +
+        'Oder schreib nochmal *fertig* um den Bericht nur mit den Fotos zu erstellen.'
+      );
+      session.text = '__nachgefragt__';
+      resetSessionTimer(from, session);
+      return;
+    }
+
+    // Text zur Session hinzufügen (oder zweites "fertig" ohne Text)
+    if (rawText.toLowerCase().trim() !== 'fertig' || session.text !== '__nachgefragt__') {
+      session.text = (session.text === '__nachgefragt__' ? '' : session.text + (session.text ? '\n' : '')) + rawText;
+    }
+
+    resetSessionTimer(from, session);
+    const photos = session.photos;
+    const combinedText = session.text === '__nachgefragt__' ? '' : session.text;
+    clearSession(from);
+
+    await sendText(from, `🔍 ${photos.length} Foto(s) + Text werden ausgewertet …`);
+    await sendText(from, '📝 Bericht wird erstellt …');
+    await createAndSendReports(from, combinedText, photos);
+    return;
+  }
+
+  // ---- Sonstiger Nachrichtentyp ----
+  await sendText(from,
+    'Ich kann aktuell Text und Fotos verarbeiten. Sprachnotizen bitte als Text schicken.'
+  );
+}
+
+async function createAndSendReports(from, text, images) {
+  try {
+    const reports = await extractReports(text, images);
+    for (const report of reports) {
+      const pdfBuffer = await generateReportPdfBuffer(report, company);
+      const filename = `Tagesbericht_${safeName(report.kunde)}_${(report.datum || '').replace(/\./g, '-')}.pdf`;
+      fs.writeFileSync(path.join(REPORTS_DIR, filename), pdfBuffer);
+      const mediaId = await uploadMedia(pdfBuffer, filename, 'application/pdf');
+      await sendDocument(from, mediaId, filename, `${report.kunde || ''} – ${report.datum || ''}`.trim());
+    }
+  } catch (err) {
+    console.error('Fehler bei Berichtserstellung:', err);
+    await sendText(from, '⚠️ Bericht konnte nicht erstellt werden. Bitte erneut versuchen.').catch(() => {});
   }
 }
 
