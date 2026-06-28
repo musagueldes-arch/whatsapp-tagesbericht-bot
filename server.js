@@ -13,6 +13,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || 'changeme';
+const CHEF_NUMBER = (process.env.CHEF_NUMBER || '').replace(/[^0-9]/g, '');
 
 const company = {
   firma: process.env.COMPANY_NAME || 'G-Therm Haustechnik',
@@ -24,6 +25,30 @@ const company = {
 
 const REPORTS_DIR = path.join(__dirname, 'reports');
 if (!fs.existsSync(REPORTS_DIR)) fs.mkdirSync(REPORTS_DIR);
+
+const HILFE_TEXT =
+  'G-Therm Bot – das kann ich:\n\n' +
+  '📝 Tagesbericht: Schick mir einfach als Text oder Sprachnachricht, was du gemacht hast ' +
+  '(Kunde/Baustelle, Arbeiten, Stunden, Material). Ich erstelle daraus eine fertige PDF.\n\n' +
+  '🎤 Sprachnachricht: Funktioniert auf Deutsch, Türkisch und Albanisch.\n\n' +
+  '📷 Foto: Schick ein Foto von einer handschriftlichen Notiz – ich lese sie aus und mache ' +
+  'einen Tagesbericht oder eine Materialliste daraus. Schreib "Material" dazu, wenn es eine Liste ist.\n\n' +
+  'Schreib jederzeit "Hilfe" für diese Übersicht.';
+
+async function forwardToChef(from, mediaId, filename, report) {
+  if (!CHEF_NUMBER) return;
+  if (from === CHEF_NUMBER) return;
+  try {
+    const info =
+      'Neuer Bericht von ' + from + '\n' +
+      'Kunde: ' + (report.kunde || '-') + '\n' +
+      'Datum: ' + (report.datum || '-');
+    await sendText(CHEF_NUMBER, info);
+    await sendDocument(CHEF_NUMBER, mediaId, filename, (report.kunde || '') + ' – ' + (report.datum || ''));
+  } catch (err) {
+    console.error('Chef-Weiterleitung fehlgeschlagen:', err);
+  }
+}
 
 // Zwischenspeicher fuer Fotos ohne Begleittext (pro Absender).
 const pendingPhotos = {};
@@ -83,6 +108,7 @@ async function buildAndSendReports(from, rawText, fotos) {
 
     const mediaId = await uploadMedia(pdfBuffer, filename, 'application/pdf');
     await sendDocument(from, mediaId, filename, `${report.kunde || ''} – ${report.datum || ''}`.trim());
+    await forwardToChef(from, mediaId, filename, report);
   }
 }
 
@@ -109,6 +135,7 @@ async function buildAndSendFromImage(from, buffer, mimeType, caption) {
     fs.writeFileSync(path.join(REPORTS_DIR, filename), pdfBuffer);
     const mediaId = await uploadMedia(pdfBuffer, filename, 'application/pdf');
     await sendDocument(from, mediaId, filename, `${report.kunde || ''} – ${report.datum || ''}`.trim());
+    await forwardToChef(from, mediaId, filename, report);
   }
 }
 
@@ -124,8 +151,13 @@ async function handleIncoming(body) {
 
     try {
       if (msg.type === 'text') {
+        const body = (msg.text.body || '').trim();
+        if (/^(hilfe|help|menu|men[üu]|start|\?)$/i.test(body)) {
+          await sendText(from, HILFE_TEXT);
+          continue;
+        }
         const fotos = takePhotos(from);
-        await buildAndSendReports(from, msg.text.body, fotos);
+        await buildAndSendReports(from, body, fotos);
         continue;
       }
 
