@@ -87,13 +87,17 @@ app.post('/webhook', (req, res) => {
 });
 
 async function handleIncoming(body) {
-  const messages = body?.entry?.[0]?.changes?.[0]?.value?.messages;
+  const entry = body?.entry?.[0];
+  const changes = entry?.changes?.[0];
+  const messages = changes?.value?.messages;
+  console.log('Webhook erhalten - Feld:', changes?.field, 'Nachrichten:', messages?.length || 0);
   if (!messages?.length) return;
   for (const msg of messages) {
+    console.log('Nachricht von', msg.from, 'Typ:', msg.type);
     try { await handleMessage(msg.from, msg); }
     catch (err) {
-      console.error('Fehler [' + msg.from + ']:', err.message);
-      await sendText(msg.from, 'Fehler. Bitte erneut versuchen.').catch(() => {});
+      console.error('Fehler [' + msg.from + ']:', err.message, err.stack?.split('\n')[1]);
+      await sendText(msg.from, 'Fehler: ' + err.message.substring(0, 100)).catch(() => {});
     }
   }
 }
@@ -103,50 +107,55 @@ async function handleMessage(from, msg) {
   const type = msg.type;
 
   if (type === 'image') {
+    console.log('Bild von', from, 'ID:', msg.image?.id);
     const s = session || createSession(from);
     s.status = 'collecting';
-    const { buffer: imgBuffer, mimeType: imgMime } = await downloadMedia(msg.image.id);
-    s.photos.push({ base64: imgBuffer.toString('base64'), mimeType: imgMime });
+    try {
+      const { buffer: imgBuffer, mimeType: imgMime } = await downloadMedia(msg.image.id);
+      console.log('Bild OK:', imgBuffer.length, 'bytes');
+      s.photos.push({ base64: imgBuffer.toString('base64'), mimeType: imgMime });
+    } catch (dlErr) {
+      console.error('Bild-Download-Fehler:', dlErr.message);
+      await sendText(from, 'Foto konnte nicht geladen werden. Bitte nochmal schicken.');
+      return;
+    }
     if (msg.image.caption) s.text += (s.text ? '\n' : '') + msg.image.caption;
     resetTimer(from, s);
-    await sendText(from,
-      'Foto ' + s.photos.length + ' erhalten.\n\nNoch mehr Fotos oder Videos? Schick sie weiter.\n\nWenn alle Medien vollstaendig sind - schreib ja'
-    );
+    await sendText(from, 'Foto ' + s.photos.length + ' erhalten.\n\nNoch mehr Fotos oder Videos? Schick sie weiter.\n\nWenn alle Medien vollstaendig sind - schreib ja');
     return;
   }
 
   if (type === 'video') {
+    console.log('Video von', from, 'ID:', msg.video?.id);
     const s = session || createSession(from);
     s.status = 'collecting';
     await sendText(from, 'Video wird verarbeitet (Frames + Ton) ...');
-    const { buffer: videoBuffer, mimeType: videoMime } = await downloadMedia(msg.video.id);
-    const frames = extractFramesFromVideo(videoBuffer, videoMime, 8);
-    s.photos.push(...frames);
-    console.log('Video: ' + frames.length + ' Frames extrahiert.');
     try {
-      const audioBuffer = extractAudioFromVideo(videoBuffer, videoMime);
-      const { text: videoTranscript, language } = await transcribeAudio(audioBuffer, 'audio/ogg');
-      if (videoTranscript) {
-        s.transcript += (s.transcript ? '\n' : '') + videoTranscript;
-        s.language = language;
-      }
-    } catch (e) {
-      console.log('Kein Ton im Video:', e.message);
+      const { buffer: videoBuffer, mimeType: videoMime } = await downloadMedia(msg.video.id);
+      const frames = extractFramesFromVideo(videoBuffer, videoMime, 8);
+      s.photos.push(...frames);
+      console.log('Video: ' + frames.length + ' Frames extrahiert.');
+      try {
+        const audioBuffer = extractAudioFromVideo(videoBuffer, videoMime);
+        const { text: videoTranscript, language } = await transcribeAudio(audioBuffer, 'audio/ogg');
+        if (videoTranscript) { s.transcript += (s.transcript ? '\n' : '') + videoTranscript; s.language = language; }
+      } catch (e) { console.log('Kein Ton im Video:', e.message); }
+      if (msg.video.caption) s.text += (s.text ? '\n' : '') + msg.video.caption;
+      resetTimer(from, s);
+      await sendText(from, 'Video verarbeitet: ' + frames.length + ' Frames.\n\nNoch mehr? Oder schreib ja wenn fertig.');
+    } catch (dlErr) {
+      console.error('Video-Download-Fehler:', dlErr.message);
+      await sendText(from, 'Video konnte nicht geladen werden: ' + dlErr.message.substring(0, 80));
     }
-    if (msg.video.caption) s.text += (s.text ? '\n' : '') + msg.video.caption;
-    resetTimer(from, s);
-    await sendText(from,
-      'Video verarbeitet: ' + frames.length + ' Frames.\n\nNoch mehr? Oder schreib ja wenn fertig.'
-    );
     return;
   }
 
   if (type === 'text') {
     const rawText = msg.text.body;
+    console.log('Text von', from, ':', rawText.substring(0, 60));
 
     if (!session) {
       await sendText(from, 'Notiz wird gelesen ...');
-      await sendText(from, 'Bericht wird erstellt ...');
       await createAndSendReports(from, rawText, []);
       return;
     }
@@ -155,9 +164,7 @@ async function handleMessage(from, msg) {
 
     if (session.status === 'collecting' && isJa(rawText)) {
       session.status = 'awaiting_desc';
-      await sendText(from,
-        'Medien gespeichert (' + session.photos.length + ' Foto(s)/Frame(s)).\n\nJetzt Beschreibung hinzufuegen:\n- Sprachnotiz aufnehmen\n- Oder als Text schreiben\n\n(Baustelle, Arbeiten, Uhrzeit, Mitarbeiter)'
-      );
+      await sendText(from, 'Medien gespeichert (' + session.photos.length + ' Foto(s)/Frame(s)).\n\nJetzt Beschreibung hinzufuegen:\n- Sprachnotiz aufnehmen\n- Oder als Text schreiben\n\n(Baustelle, Arbeiten, Uhrzeit, Mitarbeiter)');
       return;
     }
 
@@ -172,9 +179,7 @@ async function handleMessage(from, msg) {
       session.status = 'preview_text';
       const combinedText = [session.transcript, session.text].filter(Boolean).join('\n');
       const langInfo = session.language ? ' (' + session.language.label + ')' : '';
-      await sendText(from,
-        'Erkannter Text' + langInfo + ':\n\n"' + combinedText + '"\n\nIst das korrekt?\n- ja => Bericht-Entwurf erstellen\n- Oder schreib eine Korrektur'
-      );
+      await sendText(from, 'Erkannter Text' + langInfo + ':\n\n"' + combinedText + '"\n\nIst das korrekt?\n- ja => Bericht-Entwurf erstellen\n- Oder schreib eine Korrektur');
       return;
     }
 
@@ -190,16 +195,7 @@ async function handleMessage(from, msg) {
           const nr = reports.length > 1 ? 'Bericht ' + (i + 1) + '/' + reports.length + ': ' : '';
           const arbeiten = r.arbeiten ? r.arbeiten.split('\n').map(l => ' - ' + l).join('\n') : ' -';
           const material = r.material ? r.material.split('\n').slice(0, 4).map(l => ' - ' + l).join('\n') : ' -';
-          await sendText(from,
-            nr + 'Entwurf:\n\n' +
-            'Datum: ' + (r.datum || '-') + '  Zeit: ' + (r.arbeitszeit || '-') + '\n' +
-            'Kunde: ' + (r.kunde || '-') + '\n' +
-            'Mitarbeiter: ' + (r.mitarbeiter || '-') + '\n\n' +
-            'Arbeiten:\n' + arbeiten + '\n\n' +
-            'Material:\n' + material + '\n\n' +
-            'Besonderheiten: ' + (r.besonderheiten || '-') + '\n\n' +
-            'Korrekt? ja => PDF erstellen\nOder schreib was geaendert werden soll.'
-          );
+          await sendText(from, nr + 'Entwurf:\n\nDatum: ' + (r.datum || '-') + ' Zeit: ' + (r.arbeitszeit || '-') + '\nKunde: ' + (r.kunde || '-') + '\nMitarbeiter: ' + (r.mitarbeiter || '-') + '\n\nArbeiten:\n' + arbeiten + '\n\nMaterial:\n' + material + '\n\nBesonderheiten: ' + (r.besonderheiten || '-') + '\n\nKorrekt? ja => PDF erstellen\nOder schreib was geaendert werden soll.');
         }
         return;
       } else {
@@ -227,37 +223,27 @@ async function handleMessage(from, msg) {
   }
 
   if (type === 'audio') {
+    console.log('Audio von', from, 'ID:', msg.audio?.id);
     const s = session || null;
     await sendText(from, 'Sprachnotiz wird transkribiert ...');
     try {
       const { buffer: audioBuffer, mimeType: audioMime } = await downloadMedia(msg.audio.id);
       const { text: transcript, language } = await transcribeAudio(audioBuffer, audioMime);
       console.log('Transkript [' + from + ']: ' + transcript);
-
       if (!s) {
         const newSession = createSession(from);
         newSession.transcript = transcript;
         newSession.language = language;
         newSession.status = 'preview_text';
-        await sendText(from,
-          language.flag + ' Erkannte Sprache: ' + language.label + '\n\n' +
-          '"' + transcript + '"\n\n' +
-          'Ist das korrekt?\n- ja => Bericht-Entwurf erstellen\n- Oder schreib eine Korrektur'
-        );
+        await sendText(from, language.flag + ' Erkannte Sprache: ' + language.label + '\n\n"' + transcript + '"\n\nIst das korrekt?\n- ja => Bericht-Entwurf erstellen\n- Oder schreib eine Korrektur');
         return;
       }
-
       s.transcript += (s.transcript ? '\n' : '') + transcript;
       s.language = language;
       const combinedText = [s.transcript, s.text].filter(Boolean).join('\n');
-
       if (s.status === 'collecting' || s.status === 'awaiting_desc') {
         s.status = 'preview_text';
-        await sendText(from,
-          language.flag + ' ' + language.label + ' erkannt.\n\n' +
-          'Erkannter Text:\n"' + combinedText + '"\n\n' +
-          'Korrekt?\n- ja => Bericht-Entwurf\n- Oder schreib eine Korrektur'
-        );
+        await sendText(from, language.flag + ' ' + language.label + ' erkannt.\n\nErkannter Text:\n"' + combinedText + '"\n\nKorrekt?\n- ja => Bericht-Entwurf\n- Oder schreib eine Korrektur');
       } else {
         s.status = 'preview_text';
         await sendText(from, 'Notiz hinzugefuegt: "' + transcript + '"\n\nja => weiter / Oder korrigieren');
@@ -265,13 +251,13 @@ async function handleMessage(from, msg) {
       resetTimer(from, s);
     } catch (err) {
       console.error('Transkriptions-Fehler:', err.message);
-      const hint = err.message.includes('401') ? 'OpenAI-Key ungueltig.' :
-                   err.message.includes('400') ? 'Audioformat nicht erkannt.' : 'Transkription fehlgeschlagen.';
+      const hint = err.message.includes('401') ? 'OpenAI-Key ungueltig.' : err.message.includes('400') ? 'Audioformat nicht erkannt.' : 'Transkription fehlgeschlagen.';
       await sendText(from, 'Fehler: ' + hint + '\nBitte als Text schicken.');
     }
     return;
   }
 
+  console.log('Unbekannter Typ:', type, 'von', from);
   await sendText(from, 'Ich verarbeite Text, Fotos, Videos und Sprachnotizen.');
 }
 
