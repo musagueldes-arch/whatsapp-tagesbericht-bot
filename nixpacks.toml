@@ -1,2 +1,5 @@
+[phases.setup]
+nixPkgs = ["libgcc"]
+
 [phases.install]
 cmds = ["npm install"]
