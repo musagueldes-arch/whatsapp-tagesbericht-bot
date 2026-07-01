@@ -253,6 +253,8 @@ async function handleMessage(from, msg) {
         await sendText(from, '🔍 Bericht-Entwurf wird erstellt …');
         const combinedText = [session.transcript, session.text].filter(Boolean).join('\n');
         const reports = await extractReports(combinedText, session.photos);
+                const fotoBuffers = session.photos.map(p => Buffer.from(p.base64, 'base64'));
+                reports.forEach(r => { r.fotos = fotoBuffers; });
         session.reportDraft = reports;
         session.status = 'preview_report';
 
@@ -395,6 +397,8 @@ async function sendReportPdfs(from, reports) {
 async function createAndSendReports(from, text, images) {
   try {
     const reports = await extractReports(text, images);
+          const imgBuffers = images.map(p => Buffer.from(p.base64, 'base64'));
+          reports.forEach(r => { r.fotos = imgBuffers; });
     await sendReportPdfs(from, reports);
   } catch (err) {
     console.error('Bericht-Fehler:', err);
