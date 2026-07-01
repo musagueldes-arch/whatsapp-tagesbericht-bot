@@ -138,8 +138,8 @@ async function handleMessage(from, msg) {
   if (type === 'image') {
     const s = session || createSession(from);
     s.status = 'collecting';
-    const imgData = await downloadMedia(msg.image.id);
-    s.photos.push(imgData);
+    const { buffer: imgBuffer, mimeType: imgMime } = await downloadMedia(msg.image.id);
+    s.photos.push({ base64: imgBuffer.toString('base64'), mimeType: imgMime });
     if (msg.image.caption) s.text += (s.text ? '\n' : '') + msg.image.caption;
     resetTimer(from, s);
 
@@ -157,9 +157,8 @@ async function handleMessage(from, msg) {
 
     await sendText(from, '🎬 Video wird verarbeitet (Frames + Ton) …');
 
-    const { base64, mimeType } = await downloadMedia(msg.video.id);
-    const videoBuffer = Buffer.from(base64, 'base64');
-
+    const { buffer: videoBuffer, mimeType } = await downloadMedia(msg.video.id);
+    
     // Frames extrahieren
     const frames = extractFramesFromVideo(videoBuffer, mimeType, 8);
     s.photos.push(...frames);
@@ -319,8 +318,7 @@ async function handleMessage(from, msg) {
 
     await sendText(from, '🎤 Sprachnotiz wird transkribiert …');
     try {
-      const { base64, mimeType } = await downloadMedia(msg.audio.id);
-      const audioBuffer = Buffer.from(base64, 'base64');
+      const { buffer: audioBuffer, mimeType } = await downloadMedia(msg.audio.id);
       const { text: transcript, language } = await transcribeAudio(audioBuffer, mimeType);
 
       console.log(`Transkript [${from}] ${language.flag}: ${transcript}`);
